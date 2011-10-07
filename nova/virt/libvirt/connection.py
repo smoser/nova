@@ -700,7 +700,7 @@ class LibvirtConnection(driver.ComputeDriver):
         token = str(uuid.uuid4())
         host = instance['host']
 
-        ajaxterm_cmd = 'sudo socat - %s' \
+        ajaxterm_cmd = 'sudo netcat - %s' \
                        % get_pty_for_instance(instance['name'])
 
         cmd = ['ajaxterm', '--command', ajaxterm_cmd, '-t', token,
