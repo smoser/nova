@@ -703,8 +703,8 @@ class LibvirtConnection(driver.ComputeDriver):
         ajaxterm_cmd = 'sudo socat - %s' \
                        % get_pty_for_instance(instance['name'])
 
-        cmd = ['%s/tools/ajaxterm/ajaxterm.py' % utils.novadir(),
-               '--command', ajaxterm_cmd, '-t', token, '-p', port]
+        cmd = ['ajaxterm', '--command', ajaxterm_cmd, '-t', token,
+                '-p', port, '-T', '300']
 
         utils.execute(cmd)
         return {'token': token, 'host': host, 'port': port}
