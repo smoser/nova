@@ -696,6 +696,26 @@ class LibvirtConnection(driver.ComputeDriver):
         timer = utils.LoopingCall(_wait_for_boot)
         return timer.start(interval=0.5, now=True)
 
+    def _get_lxc_console(self, instance):
+        """Get the LXC console for a running libvirt domain."""
+        virt_dom = self._lookup_by_name(instance)
+        xml = virt_dom.XMLDesc(0)
+        dom = minidom.parseString(xml)
+
+        for console in dom.getElementsByTagName('console'):
+            if console.getAttribute('type') == 'pty':
+                source = console.getElementsByTagName('source')[0]
+                pty_device = source.getAttribute('path')
+
+
+        out,err = utils.execute('dd',
+                                'if=%s' % pty_device,
+                                'iflag=nonblock',
+                                run_as_root=True,
+                                check_exit_code=False)
+
+        return out
+
     def _flush_xen_console(self, virsh_output):
         LOG.info(_('virsh said: %r'), virsh_output)
         virsh_output = virsh_output[0].strip()
@@ -738,7 +758,8 @@ class LibvirtConnection(driver.ComputeDriver):
             self._append_to_file(data, console_fifo)
         elif FLAGS.libvirt_type == 'lxc':
             # LXC is also special
-            LOG.info(_("Unable to read LXC console"))
+            data = self._get_lxc_console(instance['name'])
+            self._append_to_file(data, console_fifo)
 
         return self.console_loggers[instance['name']].peek()
 
