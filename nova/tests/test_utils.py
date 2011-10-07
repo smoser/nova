@@ -15,8 +15,11 @@
 #    under the License.
 
 import datetime
+import itertools
 import os
 import tempfile
+
+import nose
 
 import nova
 from nova import exception
@@ -439,3 +442,55 @@ class MonkeyPatchTestCase(test.TestCase):
             in nova.tests.monkey_patch_example.CALLED_FUNCTION)
         self.assertFalse(package_b + 'ExampleClassB.example_method_add'
             in nova.tests.monkey_patch_example.CALLED_FUNCTION)
+
+
+class RingBufferTestCase(test.TestCase):
+    """Unit test for utils.RingBuffer()."""
+    def setUp(self):
+        super(RingBufferTestCase, self).setUp()
+        self.f = tempfile.NamedTemporaryFile()
+        self.r = utils.RingBuffer(self.f.name, max_size=4)
+
+    def tearDown(self):
+        super(RingBufferTestCase, self).tearDown()
+        self.r.close()
+        self.f.close()
+
+    def testEmpty(self):
+        self.assertEquals(self.r.peek(), '')
+
+    def testReOpen(self):
+        self.r.write('1')
+        self.r.close()
+        self.r = utils.RingBuffer(self.f.name, max_size=4)
+        self.assertEquals(self.r.peek(), '1')
+
+
+def testPermutations():
+    """Test various permutations of writing to a RingBuffer.
+
+    Try all permutations of writing [0,5) bytes three times to a RingBuffer
+    of size 4. This makes use of nose's test generator capability so cannot
+    be a subclass of test.TestCase.
+
+    """
+    def check_buffer(r, expected):
+        nose.tools.eq_(r.peek(), expected)
+
+    SIZE = 4
+    for sequence in itertools.product(range(5), range(5), range(5)):
+        f = tempfile.NamedTemporaryFile()
+        r = utils.RingBuffer(f.name, max_size=SIZE)
+        source = itertools.count()
+        expected = ''
+
+        def next_n(n):
+            return ''.join(str(next(source)) for x in range(n))
+        for entry in sequence:
+            to_insert = next_n(entry)
+            expected += to_insert
+            expected = expected[max(0, len(expected) - SIZE):]
+            r.write(to_insert)
+            yield check_buffer, r, expected
+        r.close()
+        f.close()

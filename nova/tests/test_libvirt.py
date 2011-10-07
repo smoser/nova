@@ -565,7 +565,7 @@ class LibvirtConnTestCase(test.TestCase):
             (lambda t: t.findall(parameter)[1].get('name'), 'DHCPSERVER'),
             (lambda t: t.findall(parameter)[1].get('value'), '10.0.0.1'),
             (lambda t: t.find('./devices/serial/source').get(
-                'path').split('/')[1], 'console.log'),
+                'path').split('/')[1], 'console.fifo'),
             (lambda t: t.find('./memory').text, '2097152')]
         if rescue:
             common_checks += [
@@ -1501,3 +1501,54 @@ class NWFilterTestCase(test.TestCase):
         self.assertEqual(original_filter_count - len(fakefilter.filters), 2)
 
         db.instance_destroy(admin_ctxt, instance_ref['id'])
+
+
+class ConsoleLoggerTestCase(test.TestCase):
+    def setUp(self):
+        super(ConsoleLoggerTestCase, self).setUp()
+        eventlet.monkey_patch()
+        self.directory_path = tempfile.mkdtemp()
+        self.ringbuffer_path = os.path.join(self.directory_path, 'ring')
+        self.fifo_path = os.path.join(self.directory_path, 'fifo')
+        os.mkfifo(self.fifo_path)
+        self.console_logger = connection.ConsoleLogger(self.fifo_path,
+                                                       self.ringbuffer_path)
+        eventlet.sleep(0)
+
+    def testWriteBytes(self, reopen_writer=False, reopen_reader=False):
+        fd = os.open(self.fifo_path, os.O_WRONLY)
+        os.write(fd, '0')
+        eventlet.sleep(0)
+        eventlet.sleep(0)
+        self.assertEquals(self.console_logger.ringbuffer.peek(), '0')
+        if reopen_writer:
+            os.close(fd)
+            fd = os.open(self.fifo_path, os.O_WRONLY)
+        if reopen_reader:
+            self.console_logger.close()
+            self.console_logger = connection.ConsoleLogger(
+                    self.fifo_path,
+                    self.ringbuffer_path)
+            eventlet.sleep(0)
+        os.write(fd, '1')
+        eventlet.sleep(0)
+        eventlet.sleep(0)
+        self.assertEquals(self.console_logger.ringbuffer.peek(), '01')
+        os.close(fd)
+
+    def testReopenWriter(self):
+        self.testWriteBytes(reopen_writer=True)
+
+    def testReopenReader(self):
+        self.testWriteBytes(reopen_reader=True)
+
+    def testReopenBoth(self):
+        self.testWriteBytes(reopen_writer=True, reopen_reader=True)
+
+    def tearDown(self):
+        super(ConsoleLoggerTestCase, self).tearDown()
+        if self.console_logger:
+            self.console_logger.close()
+        os.unlink(self.ringbuffer_path)
+        os.unlink(self.fifo_path)
+        os.rmdir(self.directory_path)

@@ -26,10 +26,12 @@ import json
 import lockfile
 import netaddr
 import os
+import os.path
 import random
 import re
 import shlex
 import socket
+import stat
 import struct
 import sys
 import time
@@ -49,6 +51,7 @@ from nova import log as logging
 from nova import version
 
 
+BITS_PER_BYTE = 8
 LOG = logging.getLogger("nova.utils")
 ISO_TIME_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 PERFECT_TIME_FORMAT = "%Y-%m-%dT%H:%M:%S.%f"
@@ -910,3 +913,132 @@ def convert_to_list_dict(lst, label):
     if not isinstance(lst, list):
         lst = [lst]
     return [{label: x} for x in lst]
+
+class RingBuffer(object):
+    """Generic userspace on-disk ringbuffer implementation."""
+    _header_max_int = (2 ** (struct.calcsize('I') * BITS_PER_BYTE)) - 1
+    _header_format = 'II'
+    _header_size = struct.calcsize(_header_format)
+
+    def __init__(self, backing_file, max_size=65536):
+        # We need one extra byte as the buffer is kept with
+        # one byte free to avoid the head==tail full/empty
+        # problem
+        max_size += 1
+
+        if not 0 < max_size <= RingBuffer._header_max_int:
+            raise ValueError(_('RingBuffer size out of range'))
+        had_already_existed = os.path.exists(backing_file)
+        self.f = self._open(backing_file)
+        if had_already_existed:
+            file_size = os.fstat(self.f.fileno()).st_size
+            if file_size:
+                current_size = file_size - self._header_size
+                if not 0 < current_size <= RingBuffer._header_max_int:
+                    self.f.close()
+                    raise ValueError(_('Disk RingBuffer size out of range'))
+                self.max_size = current_size
+
+                # If the file doesn't contain a header, assume it is corrupt
+                # and recreate
+                if file_size < self._header_size:
+                    self._write_header(0, 0)  # initialise to empty
+
+                # If head or tail point beyond the file then bomb out
+                head, tail = self._read_header()
+                if head >= current_size or tail >= current_size:
+                    self.f.close()
+                    raise ValueError(_('RingBuffer %s is corrupt') %
+                                     backing_file)
+            else:
+                # File is zero bytes: treat as new file
+                self.max_size = max_size
+                self._initialise_empty_file()
+        else:
+            self.max_size = max_size
+            self._initialise_empty_file()
+
+    def _initialise_empty_file(self):
+        os.ftruncate(self.f.fileno(), self.max_size + self._header_size)
+        self._write_header(0, 0)  # head == tail means no data
+
+    @staticmethod
+    def _open(filename):
+        """Open a file without truncating it for both reading and writing in
+        binary mode."""
+        # Built-in open() cannot open in read/write mode without truncating.
+        fd = os.open(filename, os.O_RDWR | os.O_CREAT, 0666)
+        return os.fdopen(fd, 'w+')
+
+    def _read_header(self):
+        self.f.seek(0)
+        return struct.unpack(self._header_format,
+                             self.f.read(self._header_size))
+
+    def _write_header(self, head, tail):
+        self.f.seek(0)
+        self.f.write(struct.pack(self._header_format, head, tail))
+
+    def _seek(self, pos):
+        """Seek to pos in data (ignoring header)."""
+        self.f.seek(self._header_size + pos)
+
+    def _read_slice(self, start, end):
+        if start == end:
+            return ''
+
+        self._seek(start)
+        return self.f.read(end - start)
+
+    def _write_slice(self, pos, data):
+        self._seek(pos)
+        self.f.write(data)
+
+    def peek(self):
+        """Read the entire ringbuffer without consuming it."""
+        head, tail = self._read_header()
+        if head < tail:
+            # Wraps around
+            before_wrap = self._read_slice(tail, self.max_size)
+            after_wrap = self._read_slice(0, head)
+            return before_wrap + after_wrap
+        else:
+            # Just from here to head
+            return self._read_slice(tail, head)
+
+    def write(self, data):
+        """Write some amount of data to the ringbuffer, discarding the oldest
+        data as max_size is exceeded."""
+        head, tail = self._read_header()
+        while data:
+            # Amount of data to be written on this pass
+            len_to_write = min(len(data), self.max_size - head)
+
+            # Where head will be after this write
+            new_head = head + len_to_write
+
+            # In the next comparison, new_head may be self.max_size which is
+            # logically the same point as tail == 0 and must still be within
+            # the range tested.
+            unwrapped_tail = tail if tail else self.max_size
+
+            if head < unwrapped_tail <= new_head:
+                # Write will go past tail so tail needs to be pushed back
+                tail = new_head + 1  # one past head to indicate full
+                tail %= self.max_size
+                self._write_header(head, tail)
+
+            # Write the data
+            self._write_slice(head, data[:len_to_write])
+            data = data[len_to_write:]  # data now left
+
+            # Push head back
+            head = new_head
+            head %= self.max_size
+            self._write_header(head, tail)
+
+    def flush(self):
+        self.f.flush()
+
+    def close(self):
+        self.f.close()

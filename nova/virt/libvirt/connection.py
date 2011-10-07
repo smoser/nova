@@ -37,6 +37,7 @@ Supports KVM, LXC, QEMU, UML, and XEN.
 
 """
 
+import errno
 import hashlib
 import functools
 import multiprocessing
@@ -44,7 +45,9 @@ import netaddr
 import os
 import random
 import re
+import select
 import shutil
+import stat
 import sys
 import tempfile
 import time
@@ -52,6 +55,7 @@ import uuid
 from xml.dom import minidom
 from xml.etree import ElementTree
 
+import eventlet
 from eventlet import greenthread
 from eventlet import tpool
 
@@ -141,6 +145,8 @@ flags.DEFINE_string('default_local_format',
 flags.DEFINE_bool('libvirt_use_virtio_for_bridges',
                   False,
                   'Use virtio for bridge interfaces')
+flags.DEFINE_integer('libvirt_console_log_size', 2 ** 16,
+                     'libvirt console log ringbuffer size')
 
 
 def get_connection(read_only):
@@ -170,6 +176,57 @@ def _get_eph_disk(ephemeral):
     return 'disk.eph' + str(ephemeral['num'])
 
 
+class ConsoleLogger(object):
+
+    def __init__(self, fifo_path, ringbuffer_path):
+        self.fifo_path = fifo_path
+        self.fd = None
+        self.data_queue = eventlet.queue.LightQueue(0)
+        self.ringbuffer = utils.RingBuffer(ringbuffer_path,
+                                           FLAGS.libvirt_console_log_size)
+        self.reader_thread = eventlet.spawn(self._reader_thread_func)
+        self.writer_thread = eventlet.spawn(self._writer_thread_func)
+
+    def _reopen(self):
+        if self.fd is not None:
+            os.close(self.fd)
+            self.fd = None
+        self.fd = os.open(self.fifo_path, os.O_RDONLY | os.O_NONBLOCK)
+
+    def _reader_thread_func(self):
+        self._reopen()
+        while True:
+            select.select([self.fd], [], [])
+            data = os.read(self.fd, 1024)
+            if data:
+                self.data_queue.put(data)
+            else:
+                self._reopen()
+
+    def _writer_thread_func(self):
+        try:
+            data = self.data_queue.get()
+            while data:
+                self.ringbuffer.write(data)
+                data = self.data_queue.get()
+        finally:
+            self.ringbuffer.close()
+
+    def close(self):
+        self.reader_thread.kill()
+        self.data_queue.put(None)
+        try:
+            self.writer_thread.wait()
+        except eventlet.greenlet.GreenletExit:
+            pass
+        if self.fd is not None:
+            os.close(self.fd)
+            self.fd = None
+
+    def peek(self):
+        return self.ringbuffer.peek()
+
+
 class LibvirtConnection(driver.ComputeDriver):
 
     def __init__(self, read_only):
@@ -185,9 +242,15 @@ class LibvirtConnection(driver.ComputeDriver):
         self.firewall_driver = fw_class(get_connection=self._get_connection)
         self.vif_driver = utils.import_object(FLAGS.libvirt_vif_driver)
 
+        self.console_loggers = dict()
+
     def init_host(self, host):
         # NOTE(nsokolov): moved instance restarting to ComputeManager
-        pass
+        for name in self.list_instances():
+            base_path = os.path.join(FLAGS.instances_path, name)
+            fifo_path = os.path.join(base_path, 'console.fifo.out')
+            ringbuffer_path = os.path.join(base_path, 'console.ring')
+            self._start_console_logger(name, fifo_path, ringbuffer_path)
 
     def _get_connection(self):
         if not self._wrapped_conn or not self._test_connection():
@@ -228,6 +291,15 @@ class LibvirtConnection(driver.ComputeDriver):
             return libvirt.openReadOnly(uri)
         else:
             return libvirt.openAuth(uri, auth, 0)
+
+    def _start_console_logger(self, name, fifo_path, ringbuffer_path):
+        self._stop_console_logger(name)
+        self.console_loggers[name] = ConsoleLogger(fifo_path, ringbuffer_path)
+
+    def _stop_console_logger(self, name):
+        if name in self.console_loggers:
+            self.console_loggers[name].close()
+            del self.console_loggers[name]
 
     def list_instances(self):
         return [self._conn.lookupByID(x).name()
@@ -333,6 +405,7 @@ class LibvirtConnection(driver.ComputeDriver):
     def _cleanup(self, instance):
         target = os.path.join(FLAGS.instances_path, instance['name'])
         instance_name = instance['name']
+        self._stop_console_logger(instance_name)
         LOG.info(_('instance %(instance_name)s: deleting instance files'
                 ' %(target)s') % locals())
         if FLAGS.libvirt_type == 'lxc':
@@ -652,24 +725,22 @@ class LibvirtConnection(driver.ComputeDriver):
 
     @exception.wrap_exception()
     def get_console_output(self, instance):
-        console_log = os.path.join(FLAGS.instances_path, instance['name'],
-                                   'console.log')
+        console_fifo = os.path.join(FLAGS.instances_path, instance['name'],
+                                   'console.fifo.out')
 
-        utils.execute('chown', os.getuid(), console_log, run_as_root=True)
+        utils.execute('chown', os.getuid(), console_fifo, run_as_root=True)
 
         if FLAGS.libvirt_type == 'xen':
             # Xen is special
             virsh_output = utils.execute('virsh', 'ttyconsole',
                                          instance['name'])
             data = self._flush_xen_console(virsh_output)
-            fpath = self._append_to_file(data, console_log)
+            self._append_to_file(data, console_fifo)
         elif FLAGS.libvirt_type == 'lxc':
             # LXC is also special
             LOG.info(_("Unable to read LXC console"))
-        else:
-            fpath = console_log
 
-        return self._dump_file(fpath)
+        return self.console_loggers[instance['name']].peek()
 
     @exception.wrap_exception()
     def get_ajax_console(self, instance):
@@ -816,11 +887,25 @@ class LibvirtConnection(driver.ComputeDriver):
             container_dir = '%s/rootfs' % basepath(suffix='')
             utils.execute('mkdir', '-p', container_dir)
 
-        # NOTE(vish): No need add the suffix to console.log
-        console_log = basepath('console.log', '')
-        if os.path.exists(console_log):
-            utils.execute('chown', os.getuid(), console_log, run_as_root=True)
-        os.close(os.open(console_log, os.O_CREAT | os.O_WRONLY, 0660))
+        # NOTE(vish): No need add the suffix
+        console_fifo = basepath('console.fifo', '')
+        console_ring = basepath('console.ring', '')
+
+        for fifo_suffix in ['.in', '.out']:
+            console_fifo_suffix = console_fifo + fifo_suffix
+            try:
+                console_fifo_stat = os.stat(console_fifo_suffix)
+            except OSError, e:
+                if e.errno == errno.ENOENT:
+                    os.mkfifo(console_fifo_suffix, 0660)
+                else:
+                    raise
+            else:
+                utils.execute('chown', os.getuid(), console_fifo,
+                              run_as_root=True)
+        self._start_console_logger(inst['name'],
+                                   console_fifo + '.out',
+                                   console_ring)
 
         if not disk_images:
             disk_images = {'image_id': inst['image_ref'],
