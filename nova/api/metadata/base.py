@@ -19,6 +19,8 @@
 """Instance Metadata information."""
 
 import base64
+import errno
+import json
 import os
 
 from nova.api.ec2 import ec2utils
@@ -187,6 +189,38 @@ class InstanceMetadata():
                 data = data[items[i]]
 
         return data
+
+    def tofstree(self, path):
+        # create the EC2 tree
+        ec2_path = os.path.join(path, "ec2")
+        try:
+            os.mkdir(ec2_path)
+        except OSError as e:
+            if e.errno == errno.EEXIST:
+                pass
+            else:
+                raise
+
+        for ver in VERSIONS + ["latest"]:
+            data = self.get_ec2_metadata(version=ver)
+
+            # this really should remove *any* '_name' entries that are in
+            # this dict, as we do not want to expose them in the fs rendering.
+            # right now, this is the only one.
+            if 'public-keys' in data['meta-data']:
+                del data['meta-data']['public-keys']['0']['_name']
+
+            # user-data in ec2 can be binary, but json does not support
+            # binary data.  Paths to binary fields should be added to the
+            # top level _encoded-fields list
+            data['_encoded-fields'] = []
+            if 'user-data' in data:
+                data['_encoded-fields'].append('user-data')
+                data['user-data'] = base64.b64encode(data['user-data'])
+        
+            fpath = os.path.join(ec2_path, ver + ".json")
+            with open(fpath, "w") as fp:
+                fp.write(json.dumps(data))
 
 
 def get_metadata_by_address(address):

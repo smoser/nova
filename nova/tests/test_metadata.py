@@ -20,7 +20,11 @@
 
 import base64
 from copy import copy
+import json
 import re
+import os.path
+import shutil
+from tempfile import mkdtemp
 
 import stubout
 import webob
@@ -281,3 +285,70 @@ class MetadataHandlerTestCase(test.TestCase):
                                 fake_get_metadata=fake_get_metadata,
                                 headers=None)
         self.assertEqual(response.status_int, 500)
+
+
+class MetadataConfigDrive(test.TestCase):
+    def setUp(self):
+        super(MetadataConfigDrive, self).setUp()
+        self.tempdir = mkdtemp(prefix="MetadataConfigDrive")
+        self.instance = INSTANCES[0]
+
+    def tearDown(self):
+        shutil.rmtree(self.tempdir)
+        super(MetadataConfigDrive, self).tearDown()
+
+    def _tempd(self, bname):
+        tmpd = os.path.join(self.tempdir, "ec2_misc")
+        os.mkdir(tmpd)
+        return tmpd
+
+    def test_fs_ec2_misc(self):
+        # miscellaneous tests on ec2 filesystem
+        tmpd = self._tempd("ec2_misc")
+
+        inst = copy(self.instance)
+
+        md = fake_InstanceMetadata(self.stubs, inst)
+        md.tofstree(tmpd)
+
+        content = open(os.path.join(tmpd, "ec2", "2009-04-04.json")).read()
+        data = json.loads(content)
+
+        self.assertEqual(data['meta-data']['instance-id'], 'i-00000001')
+        self.assertEqual(data['meta-data']['public-keys']["0"]["openssh-key"],
+            inst['key_data'])
+        #"public-keys": {"0": {"openssh-key": "ssh-rsa AAAAB3Nzai....N3NtHw== someuser@somehost"}}
+
+    def test_fs_ec2_userdata(self):
+        # verify that user-data is represented in json and in _encoded-fields
+        tmpd = self._tempd("ec2_userdata")
+
+        inst = copy(self.instance)
+        inst['user_data'] = base64.b64encode("happy")
+        md = fake_InstanceMetadata(self.stubs, inst)
+
+        md.tofstree(tmpd)
+
+        content = open(os.path.join(tmpd, "ec2", "2009-04-04.json")).read()
+        data = json.loads(content)
+
+        self.assertEqual(base64.b64decode(data['user-data']), "happy")
+        self.assertTrue('user-data' in data['_encoded-fields'])
+
+    def test_fs_ec2_no_userdata(self):
+        # if no user-data is present, 'user-data' should not be in json
+        tmpd = self._tempd("ec2_no_userdata")
+
+        inst = copy(self.instance)
+        del inst['user_data']
+        md = fake_InstanceMetadata(self.stubs, inst)
+
+        md.tofstree(tmpd)
+
+        content = open(os.path.join(tmpd, "ec2", "2009-04-04.json")).read()
+        data = json.loads(content)
+        self.assertEqual(data['meta-data']['instance-id'], 'i-00000001')
+
+        self.assertTrue('user-data' not in data)
+        self.assertTrue('user-data' not in data['_encoded-fields'])
+
